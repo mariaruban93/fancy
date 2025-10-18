@@ -392,17 +392,35 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
                 <label class="form-label">Amount</label>
                 <input type="number" step="0.01" min="0" class="form-control" name="amount" id="payOpenAmount" required>
               </div>
+            <div class="mb-3">
+              <label class="form-label">Method</label>
+              <select class="form-select" name="method" id="payOpenMethod" required>
+                <option value="cash">Cash</option>
+                <option value="bank">Bank</option>
+                <option value="wallet">Wallet</option>
+                <option value="cheque">Cheque</option>
+              </select>
+            </div>
+            <div id="payChequeDetails" style="display:none;">
               <div class="mb-3">
-                <label class="form-label">Method</label>
-                <select class="form-select" name="method" id="payOpenMethod" required>
-                  <option value="cash">Cash</option>
-                  <option value="bank">Bank</option>
-                  <option value="wallet">Wallet</option>
-                  <option value="cheque">Cheque</option>
-                </select>
+                <label class="form-label">Cheque Number</label>
+                <input type="text" class="form-control" name="cheque_number" id="payChequeNumber">
               </div>
-            </form>
-          </div>
+              <div class="mb-3">
+                <label class="form-label">Bank Name</label>
+                <input type="text" class="form-control" name="bank_name" id="payBankName">
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Bank Branch</label>
+                <input type="text" class="form-control" name="bank_branch" id="payBankBranch">
+              </div>
+              <div class="mb-3">
+                <label class="form-label">Expected Deposit Date</label>
+                <input type="date" class="form-control" name="deposit_date" id="payDepositDate">
+              </div>
+            </div>
+          </form>
+        </div>
           <div class="modal-footer">
             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
             <button type="button" class="btn btn-primary" id="savePayOpeningBtn">Save Opening Payment</button>
@@ -429,8 +447,26 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
     $('#paySupplierId').val(suppId);
     $('#payOpenAmount').val(openAmt);
     $('#payOpenMethod').val('cash');
+    $('#payChequeDetails').hide();
+    $('#payChequeNumber').val('');
+    $('#payBankName').val('');
+    $('#payBankBranch').val('');
+    $('#payDepositDate').val('');
     const modal = new bootstrap.Modal(document.getElementById('payOpeningModal'));
     modal.show();
+  });
+
+  $('#payOpenMethod').on('change', function(){
+    const method = $(this).val();
+    if (method === 'cheque') {
+      $('#payChequeDetails').show();
+    } else {
+      $('#payChequeDetails').hide();
+      $('#payChequeNumber').val('');
+      $('#payBankName').val('');
+      $('#payBankBranch').val('');
+      $('#payDepositDate').val('');
+    }
   });
 
   // Save opening payment via AJAX
@@ -450,7 +486,11 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
     const payload = {
       supplier_id: suppId,
       amount: amount,
-      method: method
+      method: method,
+      cheque_number: $('#payChequeNumber').val(),
+      bank_name: method === 'cheque' ? $('#payBankName').val() : '',
+      bank_branch: method === 'cheque' ? $('#payBankBranch').val() : '',
+      deposit_date: method === 'cheque' ? $('#payDepositDate').val() : ''
     };
     $.post('ajax_pay_supplier_opening.php', payload, function(resp){
       if(resp.status === 'success'){

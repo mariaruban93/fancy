@@ -722,11 +722,6 @@ $('#openMethod').on('change', function() {
   if (method === 'cheque') {
     $('#openChequeDetails').show();
     $('#openBankDetails').hide();
-    // Default deposit date for opening cheques
-    if (!$('#openDepositDate').val()) {
-      const today = new Date().toISOString().slice(0,10);
-      $('#openDepositDate').val(today);
-    }
   } else if (method === 'bank') {
     $('#openChequeDetails').hide();
     // Populate bank select for opening
@@ -739,10 +734,12 @@ $('#openMethod').on('change', function() {
       $('#openBankMsg').show();
     }
     $('#openBankDetails').show();
+    $('#openDepositDate').val('');
   } else {
     // Cash/wallet: hide both
     $('#openChequeDetails').hide();
     $('#openBankDetails').hide();
+    $('#openDepositDate').val('');
   }
 });
 
