@@ -811,6 +811,19 @@ $st = $pdo->prepare("SELECT COALESCE(SUM(sp.amount),0)
                        AND s.sale_date<=:t".$andBranchSales);
 $st->execute(array_merge([':t'=>$end_dt], $paramB));
 $cheque_in_hand = (float)$st->fetchColumn();
+if (table_exists($pdo, 'customer_opening_payments')) {
+  try {
+    $dateCol   = first_available_col($pdo, 'customer_opening_payments', ['received_at','created_at','updated_at']);
+    $branchCol = col_exists($pdo, 'customer_opening_payments', 'branch_id') ? 'branch_id' : null;
+    $sql = "SELECT COALESCE(SUM(amount),0) FROM customer_opening_payments WHERE method='cheque' AND (deposit_date IS NULL OR deposit_date='0000-00-00')";
+    $params = [];
+    if ($dateCol) { $sql .= " AND $dateCol <= :cutoff"; $params[':cutoff'] = $end_dt; }
+    if ((!$is_admin || $branch_id) && $branchCol) { $sql .= " AND $branchCol = :cBranch"; $params[':cBranch'] = $branch_id; }
+    $st = $pdo->prepare($sql);
+    $st->execute($params);
+    $cheque_in_hand += (float)$st->fetchColumn();
+  } catch (Throwable $e) {}
+}
 $cheque_return  = 0.0;
 
 /* ------------------ Supplier & Cargo Payables ------------------ */
@@ -907,6 +920,19 @@ if ($pp_clear_col) { $sql .= " AND ($pp_clear_col IS NULL OR $pp_clear_col > :tc
 if (!$is_admin || $branch_id) { $sql .= " AND p.branch_id=:b"; $params[':b']=$branch_id; }
 $st=$pdo->prepare($sql); $st->execute($params);
 $cheque_payable=(float)$st->fetchColumn();
+if (table_exists($pdo, 'supplier_opening_payments')) {
+  try {
+    $dateCol   = first_available_col($pdo, 'supplier_opening_payments', ['paid_at','created_at','updated_at']);
+    $branchCol = col_exists($pdo, 'supplier_opening_payments', 'branch_id') ? 'branch_id' : null;
+    $sql = "SELECT COALESCE(SUM(amount),0) FROM supplier_opening_payments WHERE method='cheque' AND (deposit_date IS NULL OR deposit_date='0000-00-00')";
+    $params = [];
+    if ($dateCol) { $sql .= " AND $dateCol <= :cutoff"; $params[':cutoff'] = $end_dt; }
+    if ((!$is_admin || $branch_id) && $branchCol) { $sql .= " AND $branchCol = :sBranch"; $params[':sBranch'] = $branch_id; }
+    $st = $pdo->prepare($sql);
+    $st->execute($params);
+    $cheque_payable += (float)$st->fetchColumn();
+  } catch (Throwable $e) {}
+}
 
 $cargo_services_to_end = 0.0;
 $cargo_payments_to_end = 0.0;

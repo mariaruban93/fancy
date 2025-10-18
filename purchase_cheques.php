@@ -15,6 +15,23 @@ function col_exists(PDO $pdo, string $table, string $col): bool {
   catch (Throwable $e) { return false; }
 }
 
+function table_exists(PDO $pdo, string $table): bool {
+  try { $stmt = $pdo->query("SHOW TABLES LIKE ".$pdo->quote($table)); return (bool)($stmt && $stmt->fetchColumn()); }
+  catch (Throwable $e) { return false; }
+}
+
+function first_available_col(PDO $pdo, string $table, array $candidates): ?string {
+  foreach ($candidates as $col) {
+    try {
+      $stmt = $pdo->query("SHOW COLUMNS FROM `$table` LIKE ".$pdo->quote($col));
+      if ($stmt && $stmt->fetch(PDO::FETCH_ASSOC)) {
+        return $col;
+      }
+    } catch (Throwable $e) {}
+  }
+  return null;
+}
+
 $is_admin = (($user['role_name'] ?? '') === 'admin');
 
 /* --- branch filter --- */
@@ -109,6 +126,96 @@ if ($filter_date !== '') { $sql .= " AND pp.deposit_date = ?"; $params[] = $filt
 $sql .= " ORDER BY pp.paid_at DESC";
 $st = $pdo->prepare($sql); $st->execute($params);
 $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+foreach ($rows as &$row) {
+  $row['source']     = 'purchase';
+  $row['unique_key'] = 'purchase_' . $row['payment_id'];
+  $times = [];
+  if (!empty($row['paid_at'])) $times[] = strtotime($row['paid_at']);
+  $row['sort_key'] = $times ? max($times) : 0;
+}
+unset($row);
+
+if (table_exists($pdo, 'supplier_opening_payments')) {
+  $branchCol = col_exists($pdo, 'supplier_opening_payments', 'branch_id');
+  $depositCol = col_exists($pdo, 'supplier_opening_payments', 'deposit_date');
+  $bankCol = col_exists($pdo, 'supplier_opening_payments', 'bank_account_id');
+  $paidDateCol = first_available_col($pdo, 'supplier_opening_payments', ['paid_at','created_at','updated_at']);
+
+  $branchJoin = 'LEFT JOIN branches b ON ';
+  if ($branchCol) {
+    $branchJoin .= 'sop.branch_id = b.id';
+  } elseif (col_exists($pdo,'suppliers','branch_id')) {
+    $branchJoin .= 's.branch_id = b.id';
+  } else {
+    $branchJoin .= '1=0';
+  }
+
+  $sqlOpen = "SELECT
+        sop.id AS payment_id,
+        NULL AS purchase_id,
+        sop.amount,
+        sop.cheque_number,
+        sop.bank_name,
+        sop.bank_branch,
+        NULL AS cleared_at,
+        '' AS status,
+        " . ($bankCol ? 'sop.bank_account_id' : 'NULL') . " AS deposit_bank_id,
+        sop.deposit_date,
+        " . ($paidDateCol ? "sop.$paidDateCol" : 'sop.paid_at') . " AS paid_at,
+        " . ($branchCol ? 'sop.branch_id' : 'NULL') . " AS branch_id,
+        b.name AS branch_name,
+        s.name AS supplier_name
+      FROM supplier_opening_payments sop
+      LEFT JOIN suppliers s ON sop.supplier_id = s.id
+      $branchJoin
+      WHERE sop.method='cheque'";
+
+  $paramsOpen = [];
+  if ($depositCol) {
+    $sqlOpen .= " AND (sop.deposit_date IS NULL OR sop.deposit_date = '0000-00-00')";
+  }
+  if ($filter_branch_id && $branchCol) {
+    $sqlOpen .= " AND sop.branch_id = :obranch";
+    $paramsOpen[':obranch'] = $filter_branch_id;
+  } elseif ($filter_branch_id && !$branchCol && col_exists($pdo,'suppliers','branch_id')) {
+    $sqlOpen .= " AND s.branch_id = :obranch";
+    $paramsOpen[':obranch'] = $filter_branch_id;
+  } elseif (!$is_admin && $filter_branch_id === 0) {
+    $myBranch = (int)($user['branch_id'] ?? 0);
+    if ($myBranch) {
+      if ($branchCol) {
+        $sqlOpen .= " AND sop.branch_id = :mybranch";
+        $paramsOpen[':mybranch'] = $myBranch;
+      } elseif (col_exists($pdo,'suppliers','branch_id')) {
+        $sqlOpen .= " AND s.branch_id = :mybranch";
+        $paramsOpen[':mybranch'] = $myBranch;
+      }
+    }
+  }
+  if ($paidDateCol) {
+    $sqlOpen .= " AND sop.$paidDateCol <= :cutoff";
+    $paramsOpen[':cutoff'] = date('Y-m-d H:i:s');
+  }
+
+  try {
+    $stOpen = $pdo->prepare($sqlOpen);
+    $stOpen->execute($paramsOpen);
+    $openRows = $stOpen->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($openRows as &$orow) {
+      $orow['source']     = 'opening';
+      $orow['unique_key'] = 'opening_' . $orow['payment_id'];
+      $times = [];
+      if (!empty($orow['paid_at'])) $times[] = strtotime($orow['paid_at']);
+      $orow['sort_key'] = $times ? max($times) : 0;
+    }
+    unset($orow);
+    $rows = array_merge($rows, $openRows);
+  } catch (Throwable $e) {}
+}
+
+usort($rows, function(array $a, array $b) {
+  return ($b['sort_key'] <=> $a['sort_key']);
+});
 
 /* --- banks for dropdown (branch-specific + global/NULL) --- */
 $banksByBranch = [];
@@ -180,7 +287,7 @@ $today = date('Y-m-d');
       <thead>
       <tr>
         <th>ID</th>
-        <th>Purchase</th>
+        <th>Purchase / Ref</th>
         <?php if ($is_admin): ?><th>Branch</th><?php endif; ?>
         <th>Supplier</th>
         <th class="text-end">Amount (Rs.)</th>
@@ -209,7 +316,7 @@ $today = date('Y-m-d');
         ?>
         <tr>
           <td><?php echo (int)$r['payment_id']; ?></td>
-          <td><?php echo (int)$r['purchase_id']; ?></td>
+          <td><?php echo ($r['source'] === 'opening') ? 'Opening' : (int)$r['purchase_id']; ?></td>
           <?php if ($is_admin): ?><td><?php echo htmlspecialchars($r['branch_name']); ?></td><?php endif; ?>
           <td><?php echo htmlspecialchars($r['supplier_name']); ?></td>
           <td class="text-end"><?php echo number_format((float)$r['amount'],2); ?></td>
@@ -222,6 +329,7 @@ $today = date('Y-m-d');
             <?php if (!$isCleared): ?>
               <button class="btn btn-sm btn-primary open-deposit"
                       data-id="<?php echo (int)$r['payment_id']; ?>"
+                      data-source="<?php echo htmlspecialchars($r['source']); ?>"
                       data-branch="<?php echo (int)$r['branch_id']; ?>"
                       data-supplier="<?php echo htmlspecialchars($r['supplier_name']); ?>"
                       data-amount="<?php echo (float)$r['amount']; ?>"
@@ -250,6 +358,7 @@ $today = date('Y-m-d');
       </div>
       <div class="modal-body">
         <input type="hidden" id="m_payment_id">
+        <input type="hidden" id="m_source">
         <input type="hidden" id="m_branch_id">
         <div class="mb-2"><strong>Supplier:</strong> <span id="m_supplier">-</span></div>
         <div class="mb-2"><strong>Cheque #:</strong> <span id="m_chq">-</span></div>
@@ -299,6 +408,7 @@ $(function(){
   $(document).on('click','.open-deposit',function(){
     const btn = $(this);
     $('#m_payment_id').val(btn.data('id'));
+    $('#m_source').val(btn.data('source') || 'purchase');
     const bid = String(btn.data('branch'));
     $('#m_branch_id').val(bid);
     $('#m_supplier').text(btn.data('supplier') || '-');
@@ -324,6 +434,7 @@ $(function(){
 
   $('#confirmDeposit').on('click', function(){
     const id = $('#m_payment_id').val();
+    const source = $('#m_source').val() || 'purchase';
     const dd = $('#m_deposit_date').val();
     const bank = $('#m_bank_id').val();
     const today = '<?php echo $today; ?>';
@@ -336,7 +447,7 @@ $(function(){
       url: 'ajax_deposit_purchase_cheque.php',
       type: 'POST',
       dataType: 'json',
-      data: { payment_id: id, deposit_date: dd, bank_id: bank }
+      data: { payment_id: id, source: source, deposit_date: dd, bank_id: bank }
     }).done(function(resp){
       if (resp && resp.status === 'success') location.reload();
       else alert(resp && resp.message ? resp.message : 'Deposit failed');

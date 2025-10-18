@@ -8,6 +8,36 @@ require_once 'includes/header.php';
 checkRole(['admin','manager']);
 
 $is_admin = ($user['role_name'] === 'admin');
+
+function table_exists(PDO $pdo, string $table): bool {
+    try {
+        $stmt = $pdo->query("SHOW TABLES LIKE ".$pdo->quote($table));
+        return (bool)($stmt && $stmt->fetchColumn());
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function col_exists(PDO $pdo, string $table, string $col): bool {
+    try {
+        $stmt = $pdo->query("SHOW COLUMNS FROM `$table` LIKE ".$pdo->quote($col));
+        return (bool)($stmt && $stmt->fetch(PDO::FETCH_ASSOC));
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function first_available_col(PDO $pdo, string $table, array $candidates): ?string {
+    foreach ($candidates as $c) {
+        try {
+            $stmt = $pdo->query("SHOW COLUMNS FROM `$table` LIKE ".$pdo->quote($c));
+            if ($stmt && $stmt->fetch(PDO::FETCH_ASSOC)) {
+                return $c;
+            }
+        } catch (Throwable $e) {}
+    }
+    return null;
+}
 $filter_branch_id = 0;
 if ($is_admin) {
     if (isset($_GET['branch_id']) && ctype_digit($_GET['branch_id'])) {
@@ -79,6 +109,96 @@ $sql .= ' ' . $orderBy;
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
 $cheques = $stmt->fetchAll(PDO::FETCH_ASSOC);
+foreach ($cheques as &$chk) {
+    $chk['source']     = 'sale';
+    $chk['unique_key'] = 'sale_' . $chk['payment_id'];
+    $times = [];
+    if (!empty($chk['transfer_date'])) $times[] = strtotime($chk['transfer_date']);
+    if (!empty($chk['created_at']))    $times[] = strtotime($chk['created_at']);
+    if (!empty($chk['sale_date']))     $times[] = strtotime($chk['sale_date']);
+    $chk['sort_key'] = $times ? max($times) : 0;
+}
+unset($chk);
+
+if (table_exists($pdo, 'customer_opening_payments')) {
+    $openBranchCol = col_exists($pdo, 'customer_opening_payments', 'branch_id') ? 'cop.branch_id' : null;
+    $openDepositCol = col_exists($pdo, 'customer_opening_payments', 'deposit_date') ? 'cop.deposit_date' : null;
+    $openExpectedCol = col_exists($pdo, 'customer_opening_payments', 'expected_deposit_date') ? 'cop.expected_deposit_date' : 'NULL';
+    $openDateCol = first_available_col($pdo, 'customer_opening_payments', ['received_at','created_at','updated_at']);
+    $customerHasBranch = col_exists($pdo, 'customers', 'branch_id');
+    $branchJoin = 'LEFT JOIN branches b ON ';
+    if ($openBranchCol) {
+        $branchJoin .= 'cop.branch_id = b.id';
+    } elseif ($customerHasBranch) {
+        $branchJoin .= 'c.branch_id = b.id';
+    } else {
+        $branchJoin .= '1=0';
+    }
+
+    $sqlOpen = "SELECT
+            cop.id AS payment_id,
+            NULL AS sale_id,
+            cop.amount,
+            cop.cheque_number,
+            cop.bank_name,
+            cop.bank_branch,
+            cop.deposit_date,
+            $openExpectedCol AS transfer_date,
+            " . ($openDateCol ? "cop.$openDateCol" : 'cop.created_at') . " AS created_at,
+            IFNULL(c.name, 'Opening Balance') AS customer_name,
+            NULL AS sale_date,
+            " . ($openBranchCol ? $openBranchCol : 'NULL') . " AS branch_id,
+            b.name AS branch_name
+        FROM customer_opening_payments cop
+        LEFT JOIN customers c ON cop.customer_id = c.id
+        $branchJoin
+        WHERE cop.method='cheque'";
+
+    $paramsOpen = [];
+    if ($openDepositCol) {
+        $sqlOpen .= " AND ($openDepositCol IS NULL OR $openDepositCol = '0000-00-00')";
+    }
+    if ($openDateCol) {
+        $sqlOpen .= " AND cop.$openDateCol <= :cutoff";
+        $paramsOpen[':cutoff'] = date('Y-m-d H:i:s');
+    }
+    if ($filter_branch_id && $openBranchCol) {
+        $sqlOpen .= " AND cop.branch_id = :branch";
+        $paramsOpen[':branch'] = $filter_branch_id;
+    } elseif ($filter_branch_id && !$openBranchCol && $customerHasBranch) {
+        $sqlOpen .= " AND c.branch_id = :branch";
+        $paramsOpen[':branch'] = $filter_branch_id;
+    } elseif (!$is_admin && $filter_branch_id === 0) {
+        // Non admin branch scoping when no branch column exists
+        if ($openBranchCol) {
+            $sqlOpen .= " AND cop.branch_id = :branchLim";
+            $paramsOpen[':branchLim'] = (int)($user['branch_id'] ?? 0);
+        } elseif ($customerHasBranch) {
+            $sqlOpen .= " AND c.branch_id = :branchLim";
+            $paramsOpen[':branchLim'] = (int)($user['branch_id'] ?? 0);
+        }
+    }
+
+    try {
+        $stmtOpen = $pdo->prepare($sqlOpen);
+        $stmtOpen->execute($paramsOpen);
+        $openingCheques = $stmtOpen->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($openingCheques as &$oc) {
+            $oc['source']     = 'opening';
+            $oc['unique_key'] = 'opening_' . $oc['payment_id'];
+            $times = [];
+            if (!empty($oc['transfer_date'])) $times[] = strtotime($oc['transfer_date']);
+            if (!empty($oc['created_at']))    $times[] = strtotime($oc['created_at']);
+            $oc['sort_key'] = $times ? max($times) : 0;
+        }
+        unset($oc);
+        $cheques = array_merge($cheques, $openingCheques);
+    } catch (Throwable $e) {}
+}
+
+usort($cheques, function(array $a, array $b) {
+    return ($b['sort_key'] <=> $a['sort_key']);
+});
 
 /* Banks by branch (include NULL branch_id as global under key 0) */
 $banksByBranch = [];
@@ -123,7 +243,7 @@ foreach ($rows as $bk) {
             <thead>
                 <tr>
                     <th>ID</th>
-                    <th>Sale ID</th>
+                    <th>Sale / Ref</th>
                     <?php if ($is_admin): ?><th>Branch</th><?php endif; ?>
                     <th>Customer</th>
                     <th class="text-end">Amount (Rs.)</th>
@@ -139,7 +259,15 @@ foreach ($rows as $bk) {
             <?php foreach ($cheques as $chk): ?>
                 <tr>
                     <td><?php echo (int)$chk['payment_id']; ?></td>
-                    <td><?php echo (int)$chk['sale_id']; ?></td>
+                    <td>
+                        <?php
+                          if ($chk['source'] === 'opening') {
+                              echo 'Opening';
+                          } else {
+                              echo (int)$chk['sale_id'];
+                          }
+                        ?>
+                    </td>
                     <?php if ($is_admin): ?><td><?php echo htmlspecialchars($chk['branch_name']); ?></td><?php endif; ?>
                     <td><?php echo htmlspecialchars($chk['customer_name']); ?></td>
                     <td class="text-end"><?php echo number_format((float)$chk['amount'], 2); ?></td>
@@ -155,12 +283,12 @@ foreach ($rows as $bk) {
                         <?php echo htmlspecialchars(date('d-M-Y', strtotime($chk['created_at']))); ?>
                     </td>
                     <td>
-                        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#depositModal<?php echo (int)$chk['payment_id']; ?>">Deposit</button>
+                        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#depositModal<?php echo htmlspecialchars($chk['unique_key']); ?>">Deposit</button>
                     </td>
                 </tr>
 
                 <!-- Deposit modal -->
-                <div class="modal fade" id="depositModal<?php echo (int)$chk['payment_id']; ?>" tabindex="-1" aria-hidden="true">
+                <div class="modal fade" id="depositModal<?php echo htmlspecialchars($chk['unique_key']); ?>" tabindex="-1" aria-hidden="true">
                   <div class="modal-dialog">
                     <div class="modal-content">
                       <div class="modal-header">
@@ -169,21 +297,21 @@ foreach ($rows as $bk) {
                       </div>
                       <div class="modal-body">
                         <p>
-                          <strong>Customer:</strong> <?php echo htmlspecialchars($chk['customer_name']); ?><br>
+                          <strong><?php echo ($chk['source'] === 'opening') ? 'Customer' : 'Customer'; ?>:</strong> <?php echo htmlspecialchars($chk['customer_name']); ?><br>
                           <strong>Amount:</strong> Rs. <?php echo number_format((float)$chk['amount'], 2); ?><br>
-                          <strong>Bank:</strong> <?php echo htmlspecialchars($chk['bank_name']); ?>, <?php echo htmlspecialchars($chk['bank_branch']); ?>
+                          <strong>Bank:</strong> <?php echo htmlspecialchars($chk['bank_name']); ?><?php if (!empty($chk['bank_branch'])) echo ', '.htmlspecialchars($chk['bank_branch']); ?>
                         </p>
 
                         <!-- Deposit date (EMPTY by default now) -->
                         <div class="mb-3">
                           <label class="form-label">Deposit Date</label>
                           <input type="date" class="form-control deposit-date-input"
-                                 id="depositDate<?php echo (int)$chk['payment_id']; ?>" value="">
+                                 id="depositDate<?php echo htmlspecialchars($chk['unique_key']); ?>" value="">
                         </div>
 
                         <div class="mb-3">
                           <label class="form-label">Deposit To Bank</label>
-                          <select class="form-select" id="bankId<?php echo (int)$chk['payment_id']; ?>">
+                          <select class="form-select" id="bankId<?php echo htmlspecialchars($chk['unique_key']); ?>">
                             <?php
                               $bId     = (int)$chk['branch_id'];
                               $options = [];
@@ -198,7 +326,7 @@ foreach ($rows as $bk) {
                       </div>
                       <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                        <button type="button" class="btn btn-primary deposit-btn" data-id="<?php echo (int)$chk['payment_id']; ?>">Confirm Deposit</button>
+                        <button type="button" class="btn btn-primary deposit-btn" data-id="<?php echo (int)$chk['payment_id']; ?>" data-source="<?php echo htmlspecialchars($chk['source']); ?>" data-key="<?php echo htmlspecialchars($chk['unique_key']); ?>">Confirm Deposit</button>
                       </div>
                     </div>
                   </div>
@@ -219,8 +347,10 @@ $(function() {
 
   $(document).on('click', '.deposit-btn', function() {
     const paymentId   = $(this).data('id');
-    const dateInput   = $('#depositDate' + paymentId);
-    const bankSelect  = $('#bankId' + paymentId);
+    const source      = $(this).data('source');
+    const key         = $(this).data('key');
+    const dateInput   = $('#depositDate' + key);
+    const bankSelect  = $('#bankId' + key);
     const depositDate = dateInput.val();
     const bankId      = bankSelect.val();
 
@@ -228,7 +358,7 @@ $(function() {
     if (!bankId)      { alert('Please select a bank to deposit into.'); return; }
     if (!confirm('Mark this cheque as deposited on ' + depositDate + '?')) return;
 
-    $.post('ajax_deposit_cheque.php', {payment_id: paymentId, deposit_date: depositDate, bank_id: bankId}, function(resp) {
+    $.post('ajax_deposit_cheque.php', {payment_id: paymentId, source: source, deposit_date: depositDate, bank_id: bankId}, function(resp) {
       if (resp.status === 'success') location.reload();
       else alert(resp.message || 'Failed to deposit cheque');
     }, 'json').fail(function(){ alert('Error communicating with server'); });
