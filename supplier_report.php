@@ -65,6 +65,21 @@ if ($role === 'admin') {
   $branches = $q ? $q->fetchAll(PDO::FETCH_ASSOC) : [];
 }
 
+// Bank accounts for payment modal (match customer modal behaviour)
+$bank_accounts = [];
+try {
+  if ($role === 'admin') {
+    $stmtBA = $pdo->query("SELECT id, name, account_no FROM bank_accounts ORDER BY name");
+    $bank_accounts = $stmtBA ? $stmtBA->fetchAll(PDO::FETCH_ASSOC) : [];
+  } else {
+    $stmtBA = $pdo->prepare("SELECT id, name, account_no FROM bank_accounts WHERE branch_id = ? OR branch_id IS NULL OR branch_id = 0 ORDER BY name");
+    $stmtBA->execute([$userBidRaw > 0 ? $userBidRaw : 0]);
+    $bank_accounts = $stmtBA->fetchAll(PDO::FETCH_ASSOC);
+  }
+} catch (Throwable $e) {
+  $bank_accounts = [];
+}
+
 // ------------- WHERE fragments (positional) -------------
 $W_PURCH = '';  // purchases (p), purchase_date
 $W_PAY   = '';  // purchase_payments (pp) joined to p, filtered by p.purchase_date (kept consistent)
@@ -401,6 +416,31 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
                   <option value="cheque">Cheque</option>
                 </select>
               </div>
+              <div id="payBankDetails" style="display:none;">
+                <div class="mb-3">
+                  <label class="form-label">Bank</label>
+                  <select class="form-select" id="payBankSelect" name="bank_account_id"></select>
+                  <div id="payBankMsg" class="text-danger small mt-1" style="display:none;">No bank accounts found</div>
+                </div>
+              </div>
+              <div id="payChequeDetails" style="display:none;">
+                <div class="mb-3">
+                  <label class="form-label">Cheque Number</label>
+                  <input type="text" class="form-control" name="cheque_number" id="payChequeNumber">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Bank Name</label>
+                  <input type="text" class="form-control" name="bank_name" id="payChequeBankName">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Bank Branch</label>
+                  <input type="text" class="form-control" name="bank_branch" id="payChequeBankBranch">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Issue Date</label>
+                  <input type="date" class="form-control" name="issued_on" id="payChequeIssueDate">
+                </div>
+              </div>
             </form>
           </div>
           <div class="modal-footer">
@@ -422,15 +462,59 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
     $('#supplierReportTable').DataTable({ pageLength: 25 });
   });
 
+  const bankAccounts = <?php echo json_encode($bank_accounts); ?>;
+
+  function populatePayBankSelect() {
+    const select = $('#payBankSelect');
+    select.empty();
+    if (!Array.isArray(bankAccounts) || bankAccounts.length === 0) {
+      $('#payBankMsg').show();
+      select.hide();
+      return;
+    }
+    bankAccounts.forEach(function(bank) {
+      let label = bank.name || '';
+      if (!label) {
+        label = bank.account_no ? ('Account #' + bank.account_no) : ('Bank #' + bank.id);
+      }
+      select.append($('<option>', { value: bank.id, text: label }));
+    });
+    $('#payBankMsg').hide();
+    select.show();
+  }
+
   // Show modal to pay opening balance
   $(document).on('click', '.pay-opening-btn', function(){
     const suppId = $(this).data('supplier-id');
     const openAmt = $(this).data('open-amount');
     $('#paySupplierId').val(suppId);
     $('#payOpenAmount').val(openAmt);
-    $('#payOpenMethod').val('cash');
+    $('#payOpenMethod').val('cash').trigger('change');
+    $('#payBankSelect').val('');
+    $('#payChequeNumber').val('');
+    $('#payChequeBankName').val('');
+    $('#payChequeBankBranch').val('');
+    $('#payChequeIssueDate').val('');
     const modal = new bootstrap.Modal(document.getElementById('payOpeningModal'));
     modal.show();
+  });
+
+  $('#payOpenMethod').on('change', function(){
+    const method = $(this).val();
+    if (method === 'cheque') {
+      $('#payBankDetails').hide();
+      $('#payChequeDetails').show();
+      if (!$('#payChequeIssueDate').val()) {
+        $('#payChequeIssueDate').val(new Date().toISOString().slice(0,10));
+      }
+    } else if (method === 'bank') {
+      populatePayBankSelect();
+      $('#payBankDetails').show();
+      $('#payChequeDetails').hide();
+    } else {
+      $('#payBankDetails').hide();
+      $('#payChequeDetails').hide();
+    }
   });
 
   // Save opening payment via AJAX
@@ -447,10 +531,29 @@ for ($i = 0, $n = count($rows); $i < $n; $i++) {
       alert('Enter a valid amount');
       return;
     }
+    let bankAccountId = '';
+    let bankName = '';
+    let bankBranch = '';
+    let chequeNumber = '';
+    let issuedOn = '';
+    if (method === 'bank') {
+      bankAccountId = $('#payBankSelect').val() || '';
+      bankName = $('#payBankSelect option:selected').text() || '';
+    } else if (method === 'cheque') {
+      chequeNumber = $('#payChequeNumber').val() || '';
+      bankName = $('#payChequeBankName').val() || '';
+      bankBranch = $('#payChequeBankBranch').val() || '';
+      issuedOn = $('#payChequeIssueDate').val() || '';
+    }
     const payload = {
       supplier_id: suppId,
       amount: amount,
-      method: method
+      method: method,
+      cheque_number: chequeNumber,
+      bank_name: bankName,
+      bank_branch: bankBranch,
+      issued_on: issuedOn,
+      bank_account_id: bankAccountId
     };
     $.post('ajax_pay_supplier_opening.php', payload, function(resp){
       if(resp.status === 'success'){

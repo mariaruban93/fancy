@@ -15,6 +15,17 @@ function col_exists(PDO $pdo, string $table, string $col): bool {
   catch (Throwable $e) { return false; }
 }
 
+if (!function_exists('table_exists_purchase_cheques')) {
+  function table_exists_purchase_cheques(PDO $pdo, string $table): bool {
+    try {
+      $stmt = $pdo->query("SHOW TABLES LIKE " . $pdo->quote($table));
+      return (bool)$stmt->fetch(PDO::FETCH_NUM);
+    } catch (Throwable $e) {
+      return false;
+    }
+  }
+}
+
 $is_admin = (($user['role_name'] ?? '') === 'admin');
 
 /* --- branch filter --- */
@@ -108,7 +119,65 @@ if ($filter_date !== '') { $sql .= " AND pp.deposit_date = ?"; $params[] = $filt
 
 $sql .= " ORDER BY pp.paid_at DESC";
 $st = $pdo->prepare($sql); $st->execute($params);
-$rows = $st->fetchAll(PDO::FETCH_ASSOC);
+$rows = [];
+$purchaseRows = $st->fetchAll(PDO::FETCH_ASSOC);
+foreach ($purchaseRows as $row) {
+  $row['source'] = 'purchase';
+  $row['reference'] = 'Purchase #' . (int)$row['purchase_id'];
+  $rows[] = $row;
+}
+
+if (table_exists_purchase_cheques($pdo, 'opening_supplier_payments')) {
+  $sqlOpen = "SELECT
+                osp.id AS payment_id,
+                osp.amount,
+                osp.cheque_number,
+                osp.bank_name,
+                osp.bank_branch,
+                osp.deposit_date,
+                osp.issued_on,
+                osp.created_at,
+                COALESCE(osp.branch_id, s.branch_id, 0) AS branch_id,
+                b.name AS branch_name,
+                s.name AS supplier_name
+              FROM opening_supplier_payments osp
+              LEFT JOIN suppliers s ON osp.supplier_id = s.id
+              LEFT JOIN branches  b ON COALESCE(osp.branch_id, s.branch_id) = b.id
+              WHERE osp.method = 'cheque'";
+  $paramsOpen = [];
+  $sqlOpen .= " AND (osp.deposit_date IS NULL OR osp.deposit_date = '' OR osp.deposit_date = '0000-00-00')";
+  if ($filter_branch_id) {
+    $sqlOpen .= " AND COALESCE(osp.branch_id, s.branch_id, 0) = ?";
+    $paramsOpen[] = $filter_branch_id;
+  }
+  if ($filter_cheque !== '') {
+    $like = '%'.$filter_cheque.'%';
+    $sqlOpen .= " AND (osp.cheque_number LIKE ? OR osp.bank_name LIKE ? OR osp.bank_branch LIKE ? )";
+    array_push($paramsOpen, $like, $like, $like);
+  }
+  if ($filter_date !== '') {
+    $sqlOpen .= " AND osp.deposit_date = ?";
+    $paramsOpen[] = $filter_date;
+  }
+  $sqlOpen .= " ORDER BY osp.created_at DESC";
+  $stmtOpen = $pdo->prepare($sqlOpen);
+  $stmtOpen->execute($paramsOpen);
+  $openRows = $stmtOpen->fetchAll(PDO::FETCH_ASSOC);
+  foreach ($openRows as $row) {
+    $row['purchase_id'] = null;
+    $row['paid_at'] = $row['issued_on'] ?? $row['created_at'];
+    $row['source'] = 'opening';
+    $row['reference'] = 'Opening Balance';
+    $row['status'] = $row['status'] ?? null;
+    $rows[] = $row;
+  }
+}
+
+usort($rows, function(array $a, array $b) {
+  $aDate = $a['paid_at'] ?? $a['created_at'] ?? '';
+  $bDate = $b['paid_at'] ?? $b['created_at'] ?? '';
+  return strcmp($bDate, $aDate);
+});
 
 /* --- banks for dropdown (branch-specific + global/NULL) --- */
 $banksByBranch = [];
@@ -180,7 +249,7 @@ $today = date('Y-m-d');
       <thead>
       <tr>
         <th>ID</th>
-        <th>Purchase</th>
+        <th>Reference</th>
         <?php if ($is_admin): ?><th>Branch</th><?php endif; ?>
         <th>Supplier</th>
         <th class="text-end">Amount (Rs.)</th>
@@ -197,32 +266,38 @@ $today = date('Y-m-d');
         <tr><td colspan="<?php echo $is_admin?11:10; ?>" class="text-center text-muted">No cheques found</td></tr>
       <?php else: foreach ($rows as $r): ?>
         <?php
-          // explicit: cleared flag or status='cleared'
-          $isCleared = (!empty($r['cleared_at']))
-                    || (isset($r['status']) && strtolower($r['status'])==='cleared');
+          $isOpening = isset($r['source']) && $r['source'] === 'opening';
+          if ($isOpening) {
+            $isCleared = !empty($r['deposit_date']);
+          } else {
+            // explicit: cleared flag or status='cleared'
+            $isCleared = (!empty($r['cleared_at']))
+                      || (isset($r['status']) && strtolower($r['status'])==='cleared');
 
-          // FALLBACK when there is NO clear/status column: treat deposit_date <= today as deposited
-          if (!$isCleared && !$has_clear_col && !$has_status_col) {
-            $dd = !empty($r['deposit_date']) ? substr((string)$r['deposit_date'], 0, 10) : '';
-            $isCleared = ($dd !== '' && $dd <= $today);
+            // FALLBACK when there is NO clear/status column: treat deposit_date <= today as deposited
+            if (!$isCleared && !$has_clear_col && !$has_status_col) {
+              $dd = !empty($r['deposit_date']) ? substr((string)$r['deposit_date'], 0, 10) : '';
+              $isCleared = ($dd !== '' && $dd <= $today);
+            }
           }
         ?>
         <tr>
           <td><?php echo (int)$r['payment_id']; ?></td>
-          <td><?php echo (int)$r['purchase_id']; ?></td>
-          <?php if ($is_admin): ?><td><?php echo htmlspecialchars($r['branch_name']); ?></td><?php endif; ?>
+          <td><?php echo htmlspecialchars($r['reference']); ?></td>
+          <?php if ($is_admin): ?><td><?php echo htmlspecialchars($r['branch_name'] ?? '—'); ?></td><?php endif; ?>
           <td><?php echo htmlspecialchars($r['supplier_name']); ?></td>
           <td class="text-end"><?php echo number_format((float)$r['amount'],2); ?></td>
           <td><?php echo htmlspecialchars($r['cheque_number']); ?></td>
           <td><?php echo htmlspecialchars($r['bank_name']); ?></td>
           <td><?php echo htmlspecialchars($r['bank_branch']); ?></td>
-          <td><?php echo $r['paid_at'] ? htmlspecialchars(date('d-M-Y',strtotime($r['paid_at']))) : '-'; ?></td>
+          <td><?php echo !empty($r['paid_at']) ? htmlspecialchars(date('d-M-Y',strtotime($r['paid_at']))) : '-'; ?></td>
           <td><?php echo $r['deposit_date'] ? htmlspecialchars(date('d-M-Y',strtotime($r['deposit_date']))) : '<span class="text-muted">Not deposited</span>'; ?></td>
           <td>
             <?php if (!$isCleared): ?>
               <button class="btn btn-sm btn-primary open-deposit"
                       data-id="<?php echo (int)$r['payment_id']; ?>"
                       data-branch="<?php echo (int)$r['branch_id']; ?>"
+                      data-source="<?php echo htmlspecialchars($r['source']); ?>"
                       data-supplier="<?php echo htmlspecialchars($r['supplier_name']); ?>"
                       data-amount="<?php echo (float)$r['amount']; ?>"
                       data-chq="<?php echo htmlspecialchars($r['cheque_number']); ?>"
@@ -251,6 +326,7 @@ $today = date('Y-m-d');
       <div class="modal-body">
         <input type="hidden" id="m_payment_id">
         <input type="hidden" id="m_branch_id">
+        <input type="hidden" id="m_source" value="purchase">
         <div class="mb-2"><strong>Supplier:</strong> <span id="m_supplier">-</span></div>
         <div class="mb-2"><strong>Cheque #:</strong> <span id="m_chq">-</span></div>
         <div class="mb-2"><strong>Bank:</strong> <span id="m_bank">-</span> | <span id="m_bankbranch">-</span></div>
@@ -299,6 +375,7 @@ $(function(){
   $(document).on('click','.open-deposit',function(){
     const btn = $(this);
     $('#m_payment_id').val(btn.data('id'));
+    $('#m_source').val(btn.data('source') || 'purchase');
     const bid = String(btn.data('branch'));
     $('#m_branch_id').val(bid);
     $('#m_supplier').text(btn.data('supplier') || '-');
@@ -336,7 +413,7 @@ $(function(){
       url: 'ajax_deposit_purchase_cheque.php',
       type: 'POST',
       dataType: 'json',
-      data: { payment_id: id, deposit_date: dd, bank_id: bank }
+      data: { payment_id: id, deposit_date: dd, bank_id: bank, source: $('#m_source').val() }
     }).done(function(resp){
       if (resp && resp.status === 'success') location.reload();
       else alert(resp && resp.message ? resp.message : 'Deposit failed');

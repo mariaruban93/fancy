@@ -811,6 +811,26 @@ $st = $pdo->prepare("SELECT COALESCE(SUM(sp.amount),0)
                        AND s.sale_date<=:t".$andBranchSales);
 $st->execute(array_merge([':t'=>$end_dt], $paramB));
 $cheque_in_hand = (float)$st->fetchColumn();
+$openCheque = 0.0;
+if (table_exists($pdo, 'opening_customer_payments')) {
+  $sqlOpen = "SELECT COALESCE(SUM(ocp.amount),0)
+              FROM opening_customer_payments ocp
+              LEFT JOIN customers c ON ocp.customer_id = c.id
+              WHERE ocp.method='cheque' AND (ocp.deposit_date IS NULL OR ocp.deposit_date = '' OR ocp.deposit_date = '0000-00-00')";
+  $paramsOpen = [];
+  if (!$is_admin || $branch_id) {
+    $sqlOpen .= " AND COALESCE(ocp.branch_id, c.branch_id, 0) = :b";
+    $paramsOpen[':b'] = $branch_id;
+  }
+  try {
+    $st = $pdo->prepare($sqlOpen);
+    $st->execute($paramsOpen);
+    $openCheque = (float)$st->fetchColumn();
+  } catch (Throwable $e) {
+    $openCheque = 0.0;
+  }
+}
+$cheque_in_hand += $openCheque;
 $cheque_return  = 0.0;
 
 /* ------------------ Supplier & Cargo Payables ------------------ */
@@ -907,6 +927,24 @@ if ($pp_clear_col) { $sql .= " AND ($pp_clear_col IS NULL OR $pp_clear_col > :tc
 if (!$is_admin || $branch_id) { $sql .= " AND p.branch_id=:b"; $params[':b']=$branch_id; }
 $st=$pdo->prepare($sql); $st->execute($params);
 $cheque_payable=(float)$st->fetchColumn();
+if (table_exists($pdo, 'opening_supplier_payments')) {
+  $sql = "SELECT COALESCE(SUM(osp.amount),0)
+          FROM opening_supplier_payments osp
+          LEFT JOIN suppliers s ON osp.supplier_id = s.id
+          WHERE osp.method='cheque' AND (osp.deposit_date IS NULL OR osp.deposit_date = '' OR osp.deposit_date = '0000-00-00')";
+  $params = [];
+  if (!$is_admin || $branch_id) {
+    $sql .= " AND COALESCE(osp.branch_id, s.branch_id, 0) = :b";
+    $params[':b'] = $branch_id;
+  }
+  try {
+    $st = $pdo->prepare($sql);
+    $st->execute($params);
+    $cheque_payable += (float)$st->fetchColumn();
+  } catch (Throwable $e) {
+    // ignore
+  }
+}
 
 $cargo_services_to_end = 0.0;
 $cargo_payments_to_end = 0.0;

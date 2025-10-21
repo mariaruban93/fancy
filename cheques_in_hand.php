@@ -7,6 +7,17 @@
 require_once 'includes/header.php';
 checkRole(['admin','manager']);
 
+if (!function_exists('table_exists_cheque')) {
+    function table_exists_cheque(PDO $pdo, string $table): bool {
+        try {
+            $stmt = $pdo->query("SHOW TABLES LIKE " . $pdo->quote($table));
+            return (bool)$stmt->fetch(PDO::FETCH_NUM);
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+}
+
 $is_admin = ($user['role_name'] === 'admin');
 $filter_branch_id = 0;
 if ($is_admin) {
@@ -78,7 +89,61 @@ $sql .= ' ' . $orderBy;
 
 $stmt = $pdo->prepare($sql);
 $stmt->execute($params);
-$cheques = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$cheques = [];
+$saleCheques = $stmt->fetchAll(PDO::FETCH_ASSOC);
+foreach ($saleCheques as $row) {
+    $row['source'] = 'sale';
+    $row['modal_prefix'] = 'sale';
+    $row['reference'] = 'Sale #' . (int)$row['sale_id'];
+    $row['sort_key'] = $row['transfer_date'] ?: ($row['created_at'] ?: $row['sale_date']);
+    $cheques[] = $row;
+}
+
+if (table_exists_cheque($pdo, 'opening_customer_payments')) {
+    $sqlOpen = "SELECT
+                  ocp.id AS payment_id,
+                  ocp.amount,
+                  ocp.cheque_number,
+                  ocp.bank_name,
+                  ocp.bank_branch,
+                  ocp.deposit_date,
+                  ocp.transfer_date,
+                  ocp.created_at,
+                  ocp.received_on,
+                  COALESCE(ocp.branch_id, c.branch_id) AS branch_id,
+                  b.name AS branch_name,
+                  IFNULL(c.name, 'Walk-in') AS customer_name
+                FROM opening_customer_payments ocp
+                LEFT JOIN customers c ON ocp.customer_id = c.id
+                LEFT JOIN branches  b ON COALESCE(ocp.branch_id, c.branch_id) = b.id
+                WHERE ocp.method = 'cheque' AND ocp.deposit_date IS NULL";
+    $paramsOpen = [];
+    if ($filter_branch_id) {
+        $sqlOpen .= " AND COALESCE(ocp.branch_id, c.branch_id, 0) = ?";
+        $paramsOpen[] = $filter_branch_id;
+    }
+    $stmtOpen = $pdo->prepare($sqlOpen);
+    $stmtOpen->execute($paramsOpen);
+    $openRows = $stmtOpen->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($openRows as $row) {
+        $row['sale_id'] = null;
+        $row['sale_date'] = $row['received_on'] ?? $row['created_at'];
+        $row['source'] = 'opening';
+        $row['modal_prefix'] = 'opening';
+        $row['reference'] = 'Opening Balance';
+        if (empty($row['created_at']) && !empty($row['received_on'])) {
+            $row['created_at'] = $row['received_on'];
+        }
+        $row['sort_key'] = $row['transfer_date'] ?: ($row['created_at'] ?: $row['sale_date']);
+        $cheques[] = $row;
+    }
+}
+
+usort($cheques, function(array $a, array $b) {
+    $keyA = $a['sort_key'] ?? '';
+    $keyB = $b['sort_key'] ?? '';
+    return strcmp($keyB, $keyA);
+});
 
 /* Banks by branch (include NULL branch_id as global under key 0) */
 $banksByBranch = [];
@@ -123,7 +188,7 @@ foreach ($rows as $bk) {
             <thead>
                 <tr>
                     <th>ID</th>
-                    <th>Sale ID</th>
+                    <th>Reference</th>
                     <?php if ($is_admin): ?><th>Branch</th><?php endif; ?>
                     <th>Customer</th>
                     <th class="text-end">Amount (Rs.)</th>
@@ -139,8 +204,8 @@ foreach ($rows as $bk) {
             <?php foreach ($cheques as $chk): ?>
                 <tr>
                     <td><?php echo (int)$chk['payment_id']; ?></td>
-                    <td><?php echo (int)$chk['sale_id']; ?></td>
-                    <?php if ($is_admin): ?><td><?php echo htmlspecialchars($chk['branch_name']); ?></td><?php endif; ?>
+                    <td><?php echo htmlspecialchars($chk['reference']); ?></td>
+                    <?php if ($is_admin): ?><td><?php echo htmlspecialchars($chk['branch_name'] ?? '—'); ?></td><?php endif; ?>
                     <td><?php echo htmlspecialchars($chk['customer_name']); ?></td>
                     <td class="text-end"><?php echo number_format((float)$chk['amount'], 2); ?></td>
                     <td><?php echo htmlspecialchars($chk['cheque_number']); ?></td>
@@ -155,12 +220,15 @@ foreach ($rows as $bk) {
                         <?php echo htmlspecialchars(date('d-M-Y', strtotime($chk['created_at']))); ?>
                     </td>
                     <td>
-                        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#depositModal<?php echo (int)$chk['payment_id']; ?>">Deposit</button>
+                        <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#depositModal<?php echo htmlspecialchars($chk['modal_prefix'].$chk['payment_id']); ?>"
+                                data-source="<?php echo htmlspecialchars($chk['source']); ?>"
+                                data-prefix="<?php echo htmlspecialchars($chk['modal_prefix']); ?>"
+                                data-id="<?php echo (int)$chk['payment_id']; ?>">Deposit</button>
                     </td>
                 </tr>
 
                 <!-- Deposit modal -->
-                <div class="modal fade" id="depositModal<?php echo (int)$chk['payment_id']; ?>" tabindex="-1" aria-hidden="true">
+                <div class="modal fade" id="depositModal<?php echo htmlspecialchars($chk['modal_prefix'].$chk['payment_id']); ?>" tabindex="-1" aria-hidden="true">
                   <div class="modal-dialog">
                     <div class="modal-content">
                       <div class="modal-header">
@@ -178,12 +246,12 @@ foreach ($rows as $bk) {
                         <div class="mb-3">
                           <label class="form-label">Deposit Date</label>
                           <input type="date" class="form-control deposit-date-input"
-                                 id="depositDate<?php echo (int)$chk['payment_id']; ?>" value="">
+                                 id="depositDate-<?php echo htmlspecialchars($chk['modal_prefix']); ?>-<?php echo (int)$chk['payment_id']; ?>" value="">
                         </div>
 
                         <div class="mb-3">
                           <label class="form-label">Deposit To Bank</label>
-                          <select class="form-select" id="bankId<?php echo (int)$chk['payment_id']; ?>">
+                          <select class="form-select" id="bankId-<?php echo htmlspecialchars($chk['modal_prefix']); ?>-<?php echo (int)$chk['payment_id']; ?>">
                             <?php
                               $bId     = (int)$chk['branch_id'];
                               $options = [];
@@ -219,8 +287,10 @@ $(function() {
 
   $(document).on('click', '.deposit-btn', function() {
     const paymentId   = $(this).data('id');
-    const dateInput   = $('#depositDate' + paymentId);
-    const bankSelect  = $('#bankId' + paymentId);
+    const prefix      = $(this).data('prefix') || 'sale';
+    const source      = $(this).data('source') || 'sale';
+    const dateInput   = $('#depositDate-' + prefix + '-' + paymentId);
+    const bankSelect  = $('#bankId-' + prefix + '-' + paymentId);
     const depositDate = dateInput.val();
     const bankId      = bankSelect.val();
 
@@ -228,7 +298,7 @@ $(function() {
     if (!bankId)      { alert('Please select a bank to deposit into.'); return; }
     if (!confirm('Mark this cheque as deposited on ' + depositDate + '?')) return;
 
-    $.post('ajax_deposit_cheque.php', {payment_id: paymentId, deposit_date: depositDate, bank_id: bankId}, function(resp) {
+    $.post('ajax_deposit_cheque.php', {payment_id: paymentId, deposit_date: depositDate, bank_id: bankId, source: source}, function(resp) {
       if (resp.status === 'success') location.reload();
       else alert(resp.message || 'Failed to deposit cheque');
     }, 'json').fail(function(){ alert('Error communicating with server'); });
