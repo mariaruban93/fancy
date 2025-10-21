@@ -10,6 +10,37 @@
 require_once 'includes/header.php';
 header('Content-Type: application/json');
 
+function col_exists(PDO $pdo, string $table, string $column): bool {
+    try {
+        $stmt = $pdo->prepare("SHOW COLUMNS FROM `$table` LIKE ?");
+        $stmt->execute([$column]);
+        return (bool)$stmt->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function ensure_opening_customer_cheques(PDO $pdo): void {
+    $sql = "CREATE TABLE IF NOT EXISTS opening_customer_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                customer_id INT NOT NULL,
+                branch_id INT DEFAULT 0,
+                amount DECIMAL(18,2) NOT NULL,
+                method VARCHAR(20) NOT NULL DEFAULT 'cheque',
+                cheque_number VARCHAR(120) DEFAULT NULL,
+                bank_name VARCHAR(191) DEFAULT NULL,
+                bank_branch VARCHAR(191) DEFAULT NULL,
+                deposit_date DATE DEFAULT NULL,
+                deposit_bank_id INT DEFAULT NULL,
+                transfer_date DATE DEFAULT NULL,
+                received_on DATE DEFAULT NULL,
+                created_by INT DEFAULT NULL,
+                created_at DATETIME NOT NULL,
+                status VARCHAR(40) DEFAULT 'pending'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $pdo->exec($sql);
+}
+
 // Only admin, manager or cashier can record opening payments
 checkRole(['admin','manager','cashier']);
 
@@ -36,6 +67,7 @@ $bank_name      = isset($_POST['bank_name'])     ? trim((string)$_POST['bank_nam
 $bank_branch    = isset($_POST['bank_branch'])   ? trim((string)$_POST['bank_branch'])   : '';
 $deposit_date   = isset($_POST['deposit_date'])  ? trim((string)$_POST['deposit_date'])  : '';
 $bank_account_id = isset($_POST['bank_account_id']) ? (int)$_POST['bank_account_id'] : 0;
+$transfer_date  = isset($_POST['transfer_date']) ? trim((string)$_POST['transfer_date']) : '';
 
 // Validate payment method
 if (!in_array($method, $allowed_methods, true)) {
@@ -67,6 +99,14 @@ try {
         if ($bank_name === '') {
             throw new RuntimeException('Select a bank for '.($method==='bank'?'bank':'cheque').' payment');
         }
+        if ($method === 'cheque') {
+            if ($deposit_date !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $deposit_date)) {
+                throw new RuntimeException('Invalid deposit date');
+            }
+            if ($transfer_date !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $transfer_date)) {
+                throw new RuntimeException('Invalid transfer date');
+            }
+        }
     }
 
     // Ensure opening_balance column exists
@@ -75,13 +115,18 @@ try {
         throw new RuntimeException('Opening balance not supported on customers table');
     }
     // Fetch current opening balance
-    $stmt = $pdo->prepare("SELECT opening_balance FROM customers WHERE id=?");
+    $hasCustBranch = col_exists($pdo, 'customers', 'branch_id');
+    $cols = 'opening_balance';
+    if ($hasCustBranch) {
+        $cols .= ', branch_id';
+    }
+    $stmt = $pdo->prepare("SELECT $cols FROM customers WHERE id=?");
     $stmt->execute([$customer_id]);
-    $current = $stmt->fetchColumn();
-    if ($current === false) {
+    $custRow = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$custRow) {
         throw new RuntimeException('Customer not found');
     }
-    $current = (float)$current;
+    $current = (float)($custRow['opening_balance'] ?? 0.0);
     if ($current <= 0) {
         throw new RuntimeException('No outstanding opening balance');
     }
@@ -91,6 +136,38 @@ try {
     // Deduct the amount from opening balance
     $upd = $pdo->prepare("UPDATE customers SET opening_balance = opening_balance - ? WHERE id=?");
     $upd->execute([$amount, $customer_id]);
+
+    if ($method === 'cheque') {
+        ensure_opening_customer_cheques($pdo);
+        global $user;
+        $branchForCheque = 0;
+        if ($hasCustBranch) {
+            $branchForCheque = (int)($custRow['branch_id'] ?? 0);
+        }
+        if ($branchForCheque <= 0 && isset($user['branch_id']) && (int)$user['branch_id'] > 0) {
+            $branchForCheque = (int)$user['branch_id'];
+        }
+        $createdBy = isset($user['id']) ? (int)$user['id'] : null;
+        $createdAt = date('Y-m-d H:i:s');
+        $depositDt = ($deposit_date !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $deposit_date)) ? $deposit_date : null;
+        $transferDt = ($transfer_date !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $transfer_date)) ? $transfer_date : null;
+        $ins = $pdo->prepare("INSERT INTO opening_customer_payments (customer_id, branch_id, amount, method, cheque_number, bank_name, bank_branch, deposit_date, transfer_date, received_on, created_by, created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+        $ins->execute([
+            $customer_id,
+            $branchForCheque,
+            $amount,
+            'cheque',
+            $cheque_number !== '' ? $cheque_number : null,
+            $bank_name,
+            $bank_branch !== '' ? $bank_branch : null,
+            $depositDt,
+            $transferDt,
+            date('Y-m-d'),
+            $createdBy,
+            $createdAt
+        ]);
+    }
 
     // Record a journal entry to reflect the cash/bank/wallet inflow from the customer opening balance payment.
     try {
@@ -102,7 +179,7 @@ try {
         $accType = 'cash';
         if ($method === 'bank') $accType = 'bank';
         elseif ($method === 'wallet') $accType = 'wallet';
-        // Cheque: treat as cash inflow until deposited; adjust later when deposit occurs via deposit cheque logic.
+        elseif ($method === 'cheque') $accType = 'cheque_in_hand';
         $desc = 'Customer opening payment ('.$method.')';
         $je = $pdo->prepare("INSERT INTO journal_entries (branch_id, entry_date, account_type, amount, description, created_by, created_at) VALUES (?,?,?,?,?,?,?)");
         // Amount positive for inflow

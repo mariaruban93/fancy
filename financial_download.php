@@ -1,6 +1,17 @@
 <?php
 // Provides a CSV download of either the profit summary or balance sheet for the selected period.
 require_once 'includes/header.php';
+
+if (!function_exists('table_exists_download')) {
+    function table_exists_download(PDO $pdo, string $table): bool {
+        try {
+            $stmt = $pdo->query("SHOW TABLES LIKE " . $pdo->quote($table));
+            return (bool)$stmt->fetch(PDO::FETCH_NUM);
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+}
 // Only admin or manager can download financial statements
 checkRole(['admin','manager']);
 
@@ -210,6 +221,15 @@ $sqlCheque = "SELECT COALESCE(SUM(sp.amount),0) FROM sale_payments sp JOIN sales
 $paramsCh = [$start_dt, $end_dt];
 if ($paramsBranch) { $paramsCh[] = $branch_id; }
 $cheque_in_hand = scalar($pdo, $sqlCheque, $paramsCh);
+if (table_exists_download($pdo, 'opening_customer_payments')) {
+    $sqlOpen = "SELECT COALESCE(SUM(ocp.amount),0) FROM opening_customer_payments ocp LEFT JOIN customers c ON ocp.customer_id = c.id WHERE ocp.method='cheque' AND (ocp.deposit_date IS NULL OR ocp.deposit_date = '' OR ocp.deposit_date = '0000-00-00')";
+    $paramsOpen = [];
+    if ($paramsBranch) {
+        $sqlOpen .= " AND COALESCE(ocp.branch_id, c.branch_id, 0) = ?";
+        $paramsOpen[] = $branch_id;
+    }
+    $cheque_in_hand += scalar($pdo, $sqlOpen, $paramsOpen);
+}
 $cheque_return = 0.0;
 
 // Accounts payable (purchases + transfer cost - payments - purchase returns)

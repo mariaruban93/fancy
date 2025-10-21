@@ -764,8 +764,10 @@ $('#saveOpeningBtn').on('click', function() {
   // Determine bank name/branch based on selected method for opening payment
   let openBankName = '';
   let openBankBranch = '';
+  let openBankAccountId = '';
   if (method === 'bank') {
-    openBankName = $('#openBankSelect option:selected').val() || '';
+    openBankAccountId = $('#openBankSelect').val() || '';
+    openBankName = $('#openBankSelect option:selected').text() || '';
   } else if (method === 'cheque') {
     openBankName = $('#openBankName').val() || '';
     openBankBranch = $('#openBankBranch').val() || '';
@@ -777,7 +779,8 @@ $('#saveOpeningBtn').on('click', function() {
     cheque_number: $('#openChequeNumber').val(),
     bank_name:     openBankName,
     bank_branch:   openBankBranch,
-    deposit_date:  $('#openDepositDate').val()
+    deposit_date:  $('#openDepositDate').val(),
+    bank_account_id: openBankAccountId
   };
   $.post('ajax_receive_opening_payment.php', payload, function(resp) {
     if (resp.status === 'success') {

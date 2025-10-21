@@ -19,6 +19,36 @@
 require_once 'includes/header.php';
 header('Content-Type: application/json');
 
+function col_exists(PDO $pdo, string $table, string $column): bool {
+    try {
+        $stmt = $pdo->prepare("SHOW COLUMNS FROM `$table` LIKE ?");
+        $stmt->execute([$column]);
+        return (bool)$stmt->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function ensure_supplier_opening_cheques(PDO $pdo): void {
+    $sql = "CREATE TABLE IF NOT EXISTS opening_supplier_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                supplier_id INT NOT NULL,
+                branch_id INT DEFAULT 0,
+                amount DECIMAL(18,2) NOT NULL,
+                method VARCHAR(20) NOT NULL DEFAULT 'cheque',
+                cheque_number VARCHAR(120) DEFAULT NULL,
+                bank_name VARCHAR(191) DEFAULT NULL,
+                bank_branch VARCHAR(191) DEFAULT NULL,
+                issued_on DATE DEFAULT NULL,
+                deposit_date DATE DEFAULT NULL,
+                deposit_bank_id INT DEFAULT NULL,
+                created_by INT DEFAULT NULL,
+                created_at DATETIME NOT NULL,
+                status VARCHAR(40) DEFAULT 'issued'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    $pdo->exec($sql);
+}
+
 // Allow only admin or manager to pay supplier opening balances
 checkRole(['admin','manager']);
 
@@ -42,6 +72,12 @@ if (!in_array($method, $allowed_methods, true)) {
     exit;
 }
 
+$cheque_number  = isset($_POST['cheque_number']) ? trim((string)$_POST['cheque_number']) : '';
+$bank_name      = isset($_POST['bank_name']) ? trim((string)$_POST['bank_name']) : '';
+$bank_branch    = isset($_POST['bank_branch']) ? trim((string)$_POST['bank_branch']) : '';
+$issued_on      = isset($_POST['issued_on']) ? trim((string)$_POST['issued_on']) : '';
+$bank_account_id = isset($_POST['bank_account_id']) ? (int)$_POST['bank_account_id'] : 0;
+
 if ($supplier_id <= 0) {
     echo json_encode(['status' => 'error', 'message' => 'Missing supplier_id']);
     exit;
@@ -49,6 +85,22 @@ if ($supplier_id <= 0) {
 if ($amount <= 0) {
     echo json_encode(['status' => 'error', 'message' => 'Amount must be greater than zero']);
     exit;
+}
+if ($method === 'bank') {
+    if ($bank_account_id <= 0 && $bank_name === '') {
+        echo json_encode(['status' => 'error', 'message' => 'Select a bank for bank payment']);
+        exit;
+    }
+}
+if ($method === 'cheque') {
+    if ($bank_name === '') {
+        echo json_encode(['status' => 'error', 'message' => 'Provide bank name for cheque payment']);
+        exit;
+    }
+    if ($issued_on !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $issued_on)) {
+        echo json_encode(['status' => 'error', 'message' => 'Invalid cheque issue date']);
+        exit;
+    }
 }
 
 try {
@@ -58,22 +110,54 @@ try {
         throw new RuntimeException('Opening balance not supported on suppliers table');
     }
     // Fetch current opening balance for the supplier
-    $stmt = $pdo->prepare("SELECT opening_balance FROM suppliers WHERE id=?");
+    $hasSupplierBranch = col_exists($pdo, 'suppliers', 'branch_id');
+    $cols = 'opening_balance';
+    if ($hasSupplierBranch) {
+        $cols .= ', branch_id';
+    }
+    $stmt = $pdo->prepare("SELECT $cols FROM suppliers WHERE id=?");
     $stmt->execute([$supplier_id]);
-    $current = $stmt->fetchColumn();
-    if ($current === false) {
+    $supplierRow = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$supplierRow) {
         throw new RuntimeException('Supplier not found');
     }
-    $current = (float)$current;
+    $current = (float)($supplierRow['opening_balance'] ?? 0.0);
     if ($current <= 0) {
         throw new RuntimeException('No outstanding opening balance');
     }
     if ($amount > $current) {
         throw new RuntimeException('Payment exceeds outstanding opening balance');
     }
+    $supplierBranchId = 0;
+    if ($hasSupplierBranch) {
+        $supplierBranchId = (int)($supplierRow['branch_id'] ?? 0);
+    }
     // Deduct the amount from opening balance
     $upd = $pdo->prepare("UPDATE suppliers SET opening_balance = opening_balance - ? WHERE id=?");
     $upd->execute([$amount, $supplier_id]);
+
+    if ($method === 'cheque') {
+        ensure_supplier_opening_cheques($pdo);
+        global $user;
+        $branchForCheque = $supplierBranchId > 0 ? $supplierBranchId : ((isset($user['branch_id']) && (int)$user['branch_id'] > 0) ? (int)$user['branch_id'] : 0);
+        $createdBy = isset($user['id']) ? (int)$user['id'] : null;
+        $createdAt = date('Y-m-d H:i:s');
+        $issuedDate = ($issued_on !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $issued_on)) ? $issued_on : null;
+        $ins = $pdo->prepare("INSERT INTO opening_supplier_payments (supplier_id, branch_id, amount, method, cheque_number, bank_name, bank_branch, issued_on, created_by, created_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?)");
+        $ins->execute([
+            $supplier_id,
+            $branchForCheque,
+            $amount,
+            'cheque',
+            $cheque_number !== '' ? $cheque_number : null,
+            $bank_name,
+            $bank_branch !== '' ? $bank_branch : null,
+            $issuedDate,
+            $createdBy,
+            $createdAt
+        ]);
+    }
 
     // Record a journal entry to reflect the cash/bank/wallet outflow.  Without this,
     // cash and bank balances in the financial statement will not be affected.
@@ -86,13 +170,18 @@ try {
         $createdAt = date('Y-m-d H:i:s');
         // Determine account type for journal entry based on payment method
         $accType = 'cash';
-        if ($method === 'bank') $accType = 'bank';
-        elseif ($method === 'wallet') $accType = 'wallet';
-        // For cheque method we treat it as cash outflow immediately; users will deposit separately when cleared.
+        $jeAmount = -1 * $amount;
+        if ($method === 'bank') {
+            $accType = 'bank';
+        } elseif ($method === 'wallet') {
+            $accType = 'wallet';
+        } elseif ($method === 'cheque') {
+            $accType = 'cheque_payable';
+            $jeAmount = $amount;
+        }
         $desc = 'Supplier opening payment ('.$method.')';
         $je = $pdo->prepare("INSERT INTO journal_entries (branch_id, entry_date, account_type, amount, description, created_by, created_at) VALUES (?,?,?,?,?,?,?)");
-        // Amount is negative for outflow
-        $je->execute([$branchId, $entryDate, $accType, -1 * $amount, $desc, $createdBy, $createdAt]);
+        $je->execute([$branchId, $entryDate, $accType, $jeAmount, $desc, $createdBy, $createdAt]);
     } catch (Throwable $jex) {
         // If journal entry fails we still continue but log error
     }

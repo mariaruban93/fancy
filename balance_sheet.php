@@ -205,6 +205,21 @@ try {
 } catch (Throwable $e) {
     $cheques_in_hand = 0.0;
 }
+if (table_exists($pdo, 'opening_customer_payments')) {
+    try {
+        $sqlOpen = "SELECT COALESCE(SUM(ocp.amount),0) FROM opening_customer_payments ocp LEFT JOIN customers c ON ocp.customer_id = c.id WHERE ocp.method='cheque' AND (ocp.deposit_date IS NULL OR ocp.deposit_date = '' OR ocp.deposit_date = '0000-00-00')";
+        $paramsOpen = [];
+        if (!$is_admin || $branch_id) {
+            $sqlOpen .= " AND COALESCE(ocp.branch_id, c.branch_id, 0) = ?";
+            $paramsOpen[] = $branch_id;
+        }
+        $stOpen = $pdo->prepare($sqlOpen);
+        $stOpen->execute($paramsOpen);
+        $cheques_in_hand += (float)$stOpen->fetchColumn();
+    } catch (Throwable $e) {
+        // ignore
+    }
+}
 
 // --- Helper: branch label for header / manager view ---------------------------
 $branch_label = 'All Branches';
